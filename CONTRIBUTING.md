@@ -16,7 +16,7 @@ Requires C++20 plus CMake 3.22 or newer. On Windows use an MSVC toolchain; for C
 
 ## Testing
 
-Add a seeded test harness case in tests/ using the small harness in tests/test_util.hpp. Randomized and property tests must print their seed. Concurrency must be fixed at the source; never use a timeout as a mutation escape hatch. The suite must pass in both Release and Debug with zero warnings under the MSVC warning gate.
+Add a seeded test harness case in tests/ using the small harness in tests/test_util.hpp. Randomized and property tests must print their seed. Concurrency must be fixed at the source. The suite must pass in both Release and Debug with zero warnings under the MSVC warning gate.
 
 ## Style
 
@@ -29,5 +29,5 @@ Add a seeded test harness case in tests/ using the small harness in tests/test_u
 ## Commit
 
 - Keep commits focused and atomic.
-- The repository is committed under the identity of the project owner (pngen <pngen93@gmail.com>).
+- Commit under your own configured Git identity (`git config user.name` / `user.email`); do not attribute your work to anyone else.
 - Do not add unintended co-author trailers.
