@@ -275,7 +275,9 @@ public:
             ResourceVector n;
             if (r.status == ReservationStatus::Reserved) { if (!rsum.try_add(r.demand, n)) return Status::failure(ErrorCode::PersistenceInconsistentAccounting, "reserved sum overflow"); rsum = n; }
             else if (r.status == ReservationStatus::Committed) { if (!usum.try_add(r.demand, n)) return Status::failure(ErrorCode::PersistenceInconsistentAccounting, "used sum overflow"); usum = n; }
-            else if (!r.demand.is_zero()) return Status::failure(ErrorCode::PersistenceInconsistentAccounting, "terminal reservation carries demand");
+            // Released / expired / rolled-back reservations keep the demand they
+            // once held as history (release() never clears it). They hold no
+            // capacity and take no part in the sums, so they are accepted as is.
         }
         if (rsum != reserved) return Status::failure(ErrorCode::PersistenceInconsistentAccounting, "reserved accounting mismatch");
         if (usum != used) return Status::failure(ErrorCode::PersistenceInconsistentAccounting, "used accounting mismatch");

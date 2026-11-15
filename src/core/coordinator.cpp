@@ -70,7 +70,7 @@ void Coordinator::dispatch(NetSocket conn) {
             agents_[id] = ctx;   // replaces a dead (fenced) agent with a fresh boot
         }
         ByteWriter w;
-        w.u64(epoch_.value());
+        w.u64(epoch().value());
         admission_fabric::send_frame(ctx->sock, static_cast<std::uint16_t>(WireType::AgentRegistered), hdr.correlation, w.data());
         handle_agent(*ctx);
     } else {
@@ -84,9 +84,9 @@ void Coordinator::handle_agent(AgentConn& ctx) {
         FrameHeader hdr;
         std::vector<std::uint8_t> payload;
         Status s = ctx.sock.recv_frame(hdr, payload);
-        if (!s.ok()) { on_agent_loss(ctx.id); return; }
+        if (!s.ok()) { on_agent_loss(ctx); return; }
         if (hdr.type == static_cast<std::uint16_t>(WireType::Heartbeat)) {
-            ByteWriter w; w.u64(epoch_.value());
+            ByteWriter w; w.u64(epoch().value());
             admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::Heartbeat), hdr.correlation, w.data());
             continue;
         }
@@ -101,7 +101,7 @@ void Coordinator::handle_agent(AgentConn& ctx) {
                 continue;
             }
             // Authority: epoch must be current, boot must match the registered agent.
-            if (epoch_val != epoch_.value()) {
+            if (epoch_val != epoch().value()) {
                 ByteWriter w; encode_error_response(w, ErrorCode::StaleEpoch, "stale coordinator epoch");
                 admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                 continue;
@@ -116,8 +116,12 @@ void Coordinator::handle_agent(AgentConn& ctx) {
                 admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                 continue;
             }
-            ctx.snapshot = snap;
-            ctx.capacity_generation = snap.generation.value();
+            {
+                // Client threads read this snapshot through choose_snapshot().
+                std::lock_guard<std::mutex> lk(mu_);
+                ctx.snapshot = snap;
+                ctx.capacity_generation = snap.generation.value();
+            }
             ByteWriter w; w.u64(snap.generation.value());
             admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::CapacityAccepted), hdr.correlation, w.data());
             continue;
@@ -140,24 +144,27 @@ void Coordinator::handle_client_frame(NetSocket conn, FrameHeader hdr, std::vect
                     admission_fabric::send_frame(conn, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                     break;
                 }
-                const ResourceSnapshot* snap = choose_snapshot(d);
-                if (snap == nullptr) {
+                const std::optional<ResourceSnapshot> snap = choose_snapshot(d);
+                ResourceSnapshot empty;
+                if (!snap.has_value()) {
                     // No live agent with the required capability: engine defers.
-                    ResourceSnapshot empty;
-                    empty.generation = ResourceSnapshotGeneration(epoch_.value());
+                    empty.generation = ResourceSnapshotGeneration(epoch().value());
                     empty.timestamp = SystemClock::now();
                     for (auto& p : empty.provenance) p = Provenance::Unavailable;
-                    engine_.set_snapshot(empty);
-                } else {
-                    engine_.set_snapshot(*snap);
                 }
-                auto rr = engine_.evaluate(d);
                 ByteWriter w;
-                if (rr.has_value()) {
-                    encode_evaluate_response(w, rr.value(), 0);
-                } else {
-                    AdmissionDecision dec;
-                    encode_evaluate_response(w, dec, static_cast<std::int32_t>(rr.code()));
+                {
+                    // Choosing the capacity view and deciding against it is one
+                    // step: no other connection may change the engine in between.
+                    std::lock_guard<std::mutex> elk(engine_mu_);
+                    engine_.set_snapshot(snap.has_value() ? *snap : empty);
+                    auto rr = engine_.evaluate(d);
+                    if (rr.has_value()) {
+                        encode_evaluate_response(w, rr.value(), 0);
+                    } else {
+                        AdmissionDecision dec;
+                        encode_evaluate_response(w, dec, static_cast<std::int32_t>(rr.code()));
+                    }
                 }
                 admission_fabric::send_frame(conn, static_cast<std::uint16_t>(WireType::EvaluateResponse), hdr.correlation, w.data());
                 break;
@@ -171,7 +178,8 @@ void Coordinator::handle_client_frame(NetSocket conn, FrameHeader hdr, std::vect
                     admission_fabric::send_frame(conn, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                     break;
                 }
-                Status cs = engine_.commit_admission(id, gen);
+                Status cs = Status::success();
+                { std::lock_guard<std::mutex> elk(engine_mu_); cs = engine_.commit_admission(id, gen); }
                 ByteWriter w; w.i32(static_cast<std::int32_t>(cs.code()));
                 admission_fabric::send_frame(conn, static_cast<std::uint16_t>(WireType::CommitResponse), hdr.correlation, w.data());
                 break;
@@ -185,7 +193,8 @@ void Coordinator::handle_client_frame(NetSocket conn, FrameHeader hdr, std::vect
                     admission_fabric::send_frame(conn, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                     break;
                 }
-                Status rs = engine_.release_reservation(id);
+                Status rs = Status::success();
+                { std::lock_guard<std::mutex> elk(engine_mu_); rs = engine_.release_reservation(id); }
                 ByteWriter w; w.i32(static_cast<std::int32_t>(rs.code()));
                 admission_fabric::send_frame(conn, static_cast<std::uint16_t>(WireType::ReleaseResponse), hdr.correlation, w.data());
                 break;
@@ -199,7 +208,7 @@ void Coordinator::handle_client_frame(NetSocket conn, FrameHeader hdr, std::vect
                     admission_fabric::send_frame(conn, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                     break;
                 }
-                engine_.observe(o);
+                { std::lock_guard<std::mutex> elk(engine_mu_); engine_.observe(o); }
                 ByteWriter w; w.i32(0);
                 admission_fabric::send_frame(conn, static_cast<std::uint16_t>(WireType::ObservationAck), hdr.correlation, w.data());
                 break;
@@ -222,7 +231,7 @@ void Coordinator::handle_client_frame(NetSocket conn, FrameHeader hdr, std::vect
     }
 }
 
-const ResourceSnapshot* Coordinator::choose_snapshot(const AdmissionDescriptor& d) const {
+std::optional<ResourceSnapshot> Coordinator::choose_snapshot(const AdmissionDescriptor& d) const {
     std::lock_guard<std::mutex> lk(mu_);
     const ResourceSnapshot* best = nullptr;
     std::uint64_t best_free = 0;
@@ -235,23 +244,22 @@ const ResourceSnapshot* Coordinator::choose_snapshot(const AdmissionDescriptor& 
         std::uint64_t free = a->snapshot.headroom().get(ResourceId::AcceleratorMemory);
         if (!best || free > best_free) { best = &a->snapshot; best_free = free; }
     }
-    return best;
+    // The agent's connection thread may replace its snapshot as soon as mu_ is
+    // released, so the caller gets a copy, never a pointer into the table.
+    if (best == nullptr) return std::nullopt;
+    return *best;
 }
 
-void Coordinator::on_agent_loss(const AgentId& id) {
-    bool changed = false;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = agents_.find(id);
-        if (it != agents_.end() && it->second->alive) {
-            it->second->alive = false;   // fence this agent's capacity generation
-            changed = true;
-        }
-    }
-    if (changed) {
-        // Roll coordinator epoch so any pre-loss authority is invalidated.
-        epoch_ = epoch_.next();
-    }
+void Coordinator::on_agent_loss(const AgentConn& ctx) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = agents_.find(ctx.id);
+    // Only the agent's current registration is fenced. A connection that was
+    // already replaced by a newer registration of the same agent is stale: its
+    // loss must not take the live registration down with it.
+    if (it == agents_.end() || it->second.get() != &ctx || !it->second->alive) return;
+    it->second->alive = false;   // fence this agent's capacity generation
+    // Roll coordinator epoch so any pre-loss authority is invalidated.
+    epoch_ = epoch_.next();
 }
 
 } // namespace admission_fabric

@@ -246,4 +246,144 @@ AF_TEST(engine_stale_snapshot_rejected) {
     AF_CHECK(r.value().reason == ReasonCode::RejectStale);
 }
 
+// ---------------------------------------------------------------------------
+// Regression tests.
+// ---------------------------------------------------------------------------
+
+// A duplicate or malformed submission under the id of a reserved request is
+// rejected and leaves that request's decision and reservation binding intact.
+AF_TEST(engine_duplicate_submission_keeps_reservation_binding) {
+    AdmissionFabric f = make_engine(ByteCount{8} << 30, cuda_caps());
+    AdmissionDescriptor d = make_desc(ModelId(7), ModelRevision(1));
+    d.admission_request_id = AdmissionRequestId(31);
+    auto r1 = f.evaluate(d);
+    AF_CHECK(r1.has_value() && r1.value().is_admit() && r1.value().reservation_id.has_value());
+    if (!r1.has_value() || !r1.value().reservation_id.has_value()) return;
+    const ReservationId rid = *r1.value().reservation_id;
+    const AdmissionGeneration gen = r1.value().admission_generation;
+    AF_CHECK(f.metrics().active_reservations == 1);
+
+    auto dup = f.evaluate(d);
+    AF_CHECK(dup.has_value() && dup.value().is_reject());
+    AdmissionDescriptor bad = d;
+    bad.request_id = RequestId(0);
+    auto mal = f.evaluate(bad);
+    AF_CHECK(mal.has_value() && mal.value().reason == ReasonCode::RejectMalformed);
+
+    const RequestRecord* rec = f.request(d.admission_request_id);
+    AF_CHECK(rec != nullptr && rec->lifecycle == RequestLifecycle::Reserved);
+    AF_CHECK(rec != nullptr && rec->last_decision.has_value() && rec->last_decision->reservation_id == rid);
+    AF_CHECK(f.commit_admission(d.admission_request_id, gen).ok());
+    AF_CHECK(f.request(d.admission_request_id)->lifecycle == RequestLifecycle::Admitted);
+    AF_CHECK(f.release_reservation(rid).ok());
+    AF_CHECK(f.request(d.admission_request_id)->lifecycle == RequestLifecycle::Released);
+    AF_CHECK(f.reservations().reserved().is_zero());
+    AF_CHECK(f.reservations().used().is_zero());
+    // A released reservation is no longer an active one.
+    AF_CHECK(f.metrics().active_reservations == 0);
+}
+
+// A deferred request that is re-evaluated takes the lifecycle state of the new
+// outcome; once admitted it is Reserved, and cancelling it returns its capacity.
+AF_TEST(engine_deferred_request_takes_the_lifecycle_of_its_reevaluation) {
+    AdmissionFabric f = make_engine(ByteCount{1100} << 20, cuda_caps());
+    AdmissionDescriptor d = make_desc(ModelId(7), ModelRevision(1));
+    d.admission_request_id = AdmissionRequestId(32);
+    auto r1 = f.evaluate(d);
+    AF_CHECK(r1.has_value() && r1.value().is_defer());
+    AF_CHECK(f.request(d.admission_request_id)->lifecycle == RequestLifecycle::Deferred);
+
+    ResourceSnapshot s = f.snapshot();
+    s.generation = ResourceSnapshotGeneration(s.generation.value() + 1);
+    s.timestamp = SystemClock::now();
+    s.total.set(ResourceId::AcceleratorMemory, ByteCount{8} << 30);
+    f.set_snapshot(s);
+    auto r2 = f.evaluate(d);
+    AF_CHECK(r2.has_value() && r2.value().is_admit());
+    AF_CHECK(f.request(d.admission_request_id)->lifecycle == RequestLifecycle::Reserved);
+    AF_CHECK(f.reservations().reserved().any_nonzero());
+
+    AF_CHECK(f.cancel_request(d.admission_request_id).ok());
+    AF_CHECK(f.reservations().reserved().is_zero());
+}
+
+// A provisional reservation whose lifetime elapsed no longer holds capacity:
+// the next evaluation can use it, the request it backed is Expired, and a late
+// commit marks its request Expired as well.
+AF_TEST(engine_expired_reservations_return_capacity) {
+    AdmissionFabric f = make_engine(ByteCount{2} << 30, cuda_caps());   // room for one request
+    AdmissionPolicy p = default_policy();
+    p.name = "short-lived";
+    p.max_reservation_lifetime = Nanoseconds(1);
+    AF_CHECK(f.install_policy(p).ok());
+
+    AdmissionDescriptor d1 = make_desc(ModelId(7), ModelRevision(1));
+    d1.admission_request_id = AdmissionRequestId(33);
+    auto r1 = f.evaluate(d1);
+    AF_CHECK(r1.has_value() && r1.value().is_admit() && r1.value().reservation_id.has_value());
+    if (!r1.has_value() || !r1.value().reservation_id.has_value()) return;
+    const ReservationId rid1 = *r1.value().reservation_id;
+    // Wait, on the clock the engine uses, until that lifetime has elapsed.
+    const TimePoint expiry1 = f.reservations().find(rid1)->expires_at;
+    while (!(SystemClock::now() > expiry1)) {}
+
+    AdmissionDescriptor d2 = make_desc(ModelId(7), ModelRevision(1));
+    d2.admission_request_id = AdmissionRequestId(34);
+    d2.request_id = RequestId(2001);
+    auto r2 = f.evaluate(d2);
+    AF_CHECK(r2.has_value() && r2.value().is_admit() && r2.value().reservation_id.has_value());
+    AF_CHECK(f.request(d1.admission_request_id)->lifecycle == RequestLifecycle::Expired);
+    AF_CHECK(f.reservations().find(rid1)->status == ReservationStatus::Expired);
+    AF_CHECK(!f.commit_admission(d1.admission_request_id, r1.value().admission_generation).ok());
+    if (!r2.has_value() || !r2.value().reservation_id.has_value()) return;
+
+    const ReservationId rid2 = *r2.value().reservation_id;
+    const TimePoint expiry2 = f.reservations().find(rid2)->expires_at;
+    while (!(SystemClock::now() > expiry2)) {}
+    Status late = f.commit_admission(d2.admission_request_id, r2.value().admission_generation);
+    AF_CHECK(late.code() == ErrorCode::ReservationExpired);
+    AF_CHECK(f.request(d2.admission_request_id)->lifecycle == RequestLifecycle::Expired);
+    AF_CHECK(f.reservations().reserved().is_zero());
+    AF_CHECK(f.metrics().active_reservations == 0);
+}
+
+// A quota snapshot its authority marked stale is not used as current while the
+// policy fails closed; a policy that does not fail closed may use it.
+AF_TEST(engine_stale_quota_fails_closed) {
+    AdmissionFabric f = make_engine(ByteCount{8} << 30, cuda_caps());
+    QuotaSnapshot q(true);
+    q.generation = 1;
+    q.timestamp = SystemClock::now();
+    q.limits.set(ResourceId::AcceleratorMemory, ByteCount{8} << 30);
+    q.stale = true;
+    f.set_quota(q);
+    AdmissionDescriptor d = make_desc(ModelId(7), ModelRevision(1));
+    d.admission_request_id = AdmissionRequestId(35);
+    auto r = f.evaluate(d);
+    AF_CHECK(r.has_value() && r.value().reason == ReasonCode::DeferQuota);
+    AF_CHECK(f.reservations().reserved().is_zero());
+
+    AdmissionPolicy open = default_policy();
+    open.name = "quota-open";
+    open.quota_fail_closed = false;
+    AF_CHECK(f.install_policy(open).ok());
+    auto r2 = f.evaluate(d);
+    AF_CHECK(r2.has_value() && r2.value().is_admit());
+}
+
+// A decision records the generation of the policy that governed it, not the
+// generation the requester stamped on the descriptor.
+AF_TEST(engine_decision_records_the_governing_policy_generation) {
+    AdmissionFabric f = make_engine(ByteCount{8} << 30, cuda_caps());   // generation 1
+    AdmissionPolicy p2 = default_policy();
+    p2.name = "v2";
+    AF_CHECK(f.install_policy(p2).ok());                                // generation 2 governs
+    AdmissionDescriptor d = make_desc(ModelId(7), ModelRevision(1));   // stamped with generation 1
+    d.admission_request_id = AdmissionRequestId(36);
+    auto r = f.evaluate(d);
+    AF_CHECK(r.has_value() && r.value().is_admit());
+    AF_CHECK(r.has_value() && r.value().policy_generation == f.policies().latest_generation());
+    AF_CHECK(r.has_value() && r.value().policy_generation == PolicyGeneration(2));
+}
+
 AF_TEST_MAIN("admission-fabric-engine");

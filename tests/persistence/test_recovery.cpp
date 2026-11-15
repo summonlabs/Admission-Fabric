@@ -141,4 +141,65 @@ AF_TEST(persistence_rejects_corruption) {
     std::filesystem::remove(p);
 }
 
+// Regression: state that contains a released reservation is recoverable. A
+// released reservation keeps the demand it once held and holds no capacity.
+AF_TEST(persistence_recovers_state_with_released_reservations) {
+    std::filesystem::path p = std::filesystem::temp_directory_path() / "af_state_released.bin";
+    std::filesystem::remove(p);
+    AdmissionFabric f;
+    setup(f);
+    auto d1 = desc(AdmissionRequestId(400)); d1.request_id = RequestId(4001);
+    auto r1 = f.evaluate(d1);
+    AF_CHECK(r1.has_value() && r1.value().is_admit() && r1.value().reservation_id.has_value());
+    if (!r1.has_value() || !r1.value().reservation_id.has_value()) return;
+    AF_CHECK(f.commit_admission(AdmissionRequestId(400), r1.value().admission_generation).ok());
+    AF_CHECK(f.release_reservation(*r1.value().reservation_id).ok());
+    auto d2 = desc(AdmissionRequestId(500)); d2.request_id = RequestId(5001);
+    auto r2 = f.evaluate(d2);
+    AF_CHECK(r2.has_value() && r2.value().is_admit());
+
+    StateStore store;
+    PersistenceConfig cfg; cfg.path = p;
+    AF_CHECK(store.save(cfg, f).ok());
+    AdmissionFabric g;
+    Status ls = store.load(cfg, g);
+    AF_CHECK(ls.ok());
+    AF_CHECK(g.request(AdmissionRequestId(400)) != nullptr
+             && g.request(AdmissionRequestId(400))->lifecycle == RequestLifecycle::Released);
+    AF_CHECK(g.request(AdmissionRequestId(500)) != nullptr
+             && g.request(AdmissionRequestId(500))->lifecycle == RequestLifecycle::Reserved);
+    AF_CHECK(g.reservations().verify_accounting());
+    AF_CHECK(g.reservations().used().is_zero());
+    AF_CHECK(!g.reservations().reserved().is_zero());
+    std::filesystem::remove(p);
+}
+
+// Regression: a policy installed after recovery gets a new generation; it never
+// reuses and replaces a recovered generation.
+AF_TEST(persistence_recovered_policies_keep_their_generations) {
+    std::filesystem::path p = std::filesystem::temp_directory_path() / "af_state_policygen.bin";
+    std::filesystem::remove(p);
+    AdmissionFabric f;
+    setup(f);                                   // generation 1: "recovery"
+    AdmissionPolicy second = pol();
+    second.name = "second";
+    AF_CHECK(f.install_policy(second).ok());    // generation 2
+    StateStore store;
+    PersistenceConfig cfg; cfg.path = p;
+    AF_CHECK(store.save(cfg, f).ok());
+
+    AdmissionFabric g;
+    AF_CHECK(store.load(cfg, g).ok());
+    AF_CHECK(g.policies().generation_count() == 2);
+    AdmissionPolicy third = pol();
+    third.name = "third";
+    AF_CHECK(g.install_policy(third).ok());
+    AF_CHECK(g.policies().generation_count() == 3);
+    AF_CHECK(g.policies().latest_generation() == PolicyGeneration(3));
+    AF_CHECK(g.policies().latest() != nullptr && g.policies().latest()->name == "third");
+    const AdmissionPolicy* first = g.policies().by_generation(PolicyGeneration(1));
+    AF_CHECK(first != nullptr && first->name == "recovery");
+    std::filesystem::remove(p);
+}
+
 AF_TEST_MAIN("admission-fabric-recovery");

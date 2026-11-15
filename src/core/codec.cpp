@@ -4,6 +4,13 @@
 
 namespace admission_fabric {
 
+// Decoded enums are range-checked: a value beyond the last enumerator is
+// corruption, never a new enumerator.
+template <typename E>
+static bool enum_in_range(E v, E last) {
+    return static_cast<std::uint64_t>(v) <= static_cast<std::uint64_t>(last);
+}
+
 static void enc_opt_res(ByteWriter& w, const std::optional<ResourceVector>& o) {
     w.flag(o.has_value());
     if (o.has_value()) encode_resource_vector(w, *o);
@@ -103,7 +110,11 @@ Status decode_descriptor(ByteReader& r, AdmissionDescriptor& d) {
     if (!r.string(d.backend) || !r.string(d.dtype) || !r.string(d.quantization) || !r.string(d.workload_class))
         return Status::failure(ErrorCode::PersistenceCorrupt, "descriptor strings");
     if (!r.stringvec(d.policy_tags)) return Status::failure(ErrorCode::PersistenceCorrupt, "policy tags");
-    return r.ok() ? Status::success() : Status::failure(ErrorCode::PersistenceCorrupt, r.error());
+    if (!r.ok()) return Status::failure(ErrorCode::PersistenceCorrupt, r.error());
+    if (!enum_in_range(d.workload_type, WorkloadType::Other) || !enum_in_range(d.latency_class, LatencyClass::SoftRealtime)
+        || !enum_in_range(d.preemption, PreemptionPermission::Deferrable))
+        return Status::failure(ErrorCode::PersistenceCorrupt, "descriptor enum out of range");
+    return Status::success();
 }
 
 Status encode_snapshot(ByteWriter& w, const ResourceSnapshot& s) {
@@ -145,7 +156,12 @@ Status decode_snapshot(ByteReader& r, ResourceSnapshot& s) {
         return Status::failure(ErrorCode::PersistenceCorrupt, "hints");
     for (auto& p : s.pressure) p = static_cast<PressureLevel>(r.u8());
     for (auto& p : s.provenance) p = static_cast<Provenance>(r.u8());
-    return r.ok() ? Status::success() : Status::failure(ErrorCode::PersistenceCorrupt, r.error());
+    if (!r.ok()) return Status::failure(ErrorCode::PersistenceCorrupt, r.error());
+    for (auto p : s.pressure)
+        if (!enum_in_range(p, PressureLevel::Critical)) return Status::failure(ErrorCode::PersistenceCorrupt, "snapshot pressure out of range");
+    for (auto p : s.provenance)
+        if (!enum_in_range(p, Provenance::Unavailable)) return Status::failure(ErrorCode::PersistenceCorrupt, "snapshot provenance out of range");
+    return Status::success();
 }
 
 Status encode_reservation(ByteWriter& w, const ResourceReservation& r) {
@@ -248,9 +264,14 @@ Status decode_policy(ByteReader& r, AdmissionPolicy& p) {
         if (r.flag()) o.admit_slo_risk = r.flag();
         if (r.flag()) o.require_reservation = r.flag();
         if (r.flag()) o.small_request_boost = r.f64();
+        if (o.overcommit_mode.has_value() && !enum_in_range(*o.overcommit_mode, OvercommitMode::PredictionAware))
+            return Status::failure(ErrorCode::PersistenceCorrupt, "override overcommit mode out of range");
         p.overrides.push_back(std::move(o));
     }
-    return r.ok() ? Status::success() : Status::failure(ErrorCode::PersistenceCorrupt, r.error());
+    if (!r.ok()) return Status::failure(ErrorCode::PersistenceCorrupt, r.error());
+    if (!enum_in_range(p.overcommit, OvercommitMode::PredictionAware))
+        return Status::failure(ErrorCode::PersistenceCorrupt, "policy overcommit mode out of range");
+    return Status::success();
 }
 
 Status encode_quota(ByteWriter& w, const QuotaSnapshot& q) {
@@ -322,7 +343,10 @@ Status decode_observation(ByteReader& r, Observation& o) {
     o.input_tokens = r.u64(); o.output_tokens = r.u64();
     if (!decode_timepoint(r, o.completed_at)) return Status::failure(ErrorCode::PersistenceCorrupt, "obs ts");
     o.kind = static_cast<ObservationKind>(r.u8());
-    return r.ok() ? Status::success() : Status::failure(ErrorCode::PersistenceCorrupt, r.error());
+    if (!r.ok()) return Status::failure(ErrorCode::PersistenceCorrupt, r.error());
+    if (!enum_in_range(o.workload_type, WorkloadType::Other) || !enum_in_range(o.kind, ObservationKind::Aborted))
+        return Status::failure(ErrorCode::PersistenceCorrupt, "observation enum out of range");
+    return Status::success();
 }
 
 Status encode_decision(ByteWriter& w, const AdmissionDecision& d) {
@@ -367,7 +391,10 @@ Status decode_decision(ByteReader& r, AdmissionDecision& d) {
     if (!decode_resource_vector(r, rv)) return Status::failure(ErrorCode::PersistenceCorrupt, "decision req");
     d.predicted_requirement = ResourceRequirement(rv);
     if (!r.string(d.explanation)) return Status::failure(ErrorCode::PersistenceCorrupt, "decision expl");
-    return r.ok() ? Status::success() : Status::failure(ErrorCode::PersistenceCorrupt, r.error());
+    if (!r.ok()) return Status::failure(ErrorCode::PersistenceCorrupt, r.error());
+    if (!enum_in_range(d.outcome, AdmissionOutcome::Reject) || !enum_in_range(d.reason, ReasonCode::RejectStale))
+        return Status::failure(ErrorCode::PersistenceCorrupt, "decision enum out of range");
+    return Status::success();
 }
 
 Status encode_prediction_profile(ByteWriter& w, const PredictionProfile& p) {

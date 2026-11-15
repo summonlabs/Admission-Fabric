@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <cstdint>
@@ -36,7 +37,7 @@ public:
     void stop();
     [[nodiscard]] bool running() const { return running_; }
 
-    [[nodiscard]] CoordinatorEpoch epoch() const { return epoch_; }
+    [[nodiscard]] CoordinatorEpoch epoch() const { std::lock_guard<std::mutex> lk(mu_); return epoch_; }
     [[nodiscard]] AdmissionFabric& engine() { return engine_; }
     [[nodiscard]] const AdmissionFabric& engine() const { return engine_; }
     [[nodiscard]] std::size_t agent_count() const;
@@ -56,7 +57,12 @@ private:
         std::uint64_t capacity_generation{0};
     };
 
+    // Every connection is served on its own thread. The engine is not
+    // thread-safe, so every engine operation of a connection thread runs under
+    // engine_mu_; the agent table, each agent's snapshot and the epoch are
+    // guarded by mu_. The two locks are never held together.
     AdmissionFabric engine_;
+    std::mutex engine_mu_;
     NetSocket listener_;
     std::atomic<bool> running_{false};
     CoordinatorEpoch epoch_{1};
@@ -68,8 +74,11 @@ private:
     void handle_agent(AgentConn& ctx);
     void handle_client(NetSocket conn);
     void handle_client_frame(NetSocket conn, FrameHeader hdr, std::vector<std::uint8_t> payload);
-    [[nodiscard]] const ResourceSnapshot* choose_snapshot(const AdmissionDescriptor& d) const;
-    void on_agent_loss(const AgentId& id);
+    // A copy of the best live agent's snapshot (taken under mu_), if any.
+    [[nodiscard]] std::optional<ResourceSnapshot> choose_snapshot(const AdmissionDescriptor& d) const;
+    // The connection `ctx` was lost. Fences the agent only if `ctx` is still the
+    // agent's current registration.
+    void on_agent_loss(const AgentConn& ctx);
     [[nodiscard]] CoordinatorEpoch next_epoch_();
 };
 

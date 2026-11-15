@@ -156,4 +156,85 @@ AF_TEST(codec_rejects_truncation) {
     }
 }
 
+// Regression: decoders reject enum values beyond the last enumerator, for every
+// decoded enum, and still accept the last valid one.
+AF_TEST(codec_rejects_out_of_range_enums) {
+    auto descriptor_ok = [](const AdmissionDescriptor& d) {
+        ByteWriter w;
+        Status e = encode_descriptor(w, d);
+        AdmissionDescriptor out;
+        ByteReader r(w.data());
+        return e.ok() && decode_descriptor(r, out).ok();
+    };
+    AdmissionDescriptor d;
+    d.admission_request_id = AdmissionRequestId(1);
+    d.workload_type = WorkloadType::Other;
+    d.latency_class = LatencyClass::SoftRealtime;
+    d.preemption = PreemptionPermission::Deferrable;
+    AF_CHECK(descriptor_ok(d));
+    { AdmissionDescriptor x = d; x.workload_type = static_cast<WorkloadType>(200); AF_CHECK(!descriptor_ok(x)); }
+    { AdmissionDescriptor x = d; x.latency_class = static_cast<LatencyClass>(200); AF_CHECK(!descriptor_ok(x)); }
+    { AdmissionDescriptor x = d; x.preemption = static_cast<PreemptionPermission>(200); AF_CHECK(!descriptor_ok(x)); }
+
+    auto snapshot_ok = [](const ResourceSnapshot& s) {
+        ByteWriter w;
+        Status e = encode_snapshot(w, s);
+        ResourceSnapshot out;
+        ByteReader r(w.data());
+        return e.ok() && decode_snapshot(r, out).ok();
+    };
+    ResourceSnapshot s;
+    for (auto& p : s.pressure) p = PressureLevel::Critical;
+    for (auto& p : s.provenance) p = Provenance::Unavailable;
+    AF_CHECK(snapshot_ok(s));
+    { ResourceSnapshot x = s; x.pressure[3] = static_cast<PressureLevel>(200); AF_CHECK(!snapshot_ok(x)); }
+    { ResourceSnapshot x = s; x.provenance[3] = static_cast<Provenance>(200); AF_CHECK(!snapshot_ok(x)); }
+
+    auto policy_ok = [](const AdmissionPolicy& p) {
+        ByteWriter w;
+        Status e = encode_policy(w, p);
+        AdmissionPolicy out;
+        ByteReader r(w.data());
+        return e.ok() && decode_policy(r, out).ok();
+    };
+    AdmissionPolicy pol;
+    pol.overcommit = OvercommitMode::PredictionAware;
+    PolicyOverride ov;
+    ov.key = "tenant=3";
+    ov.overcommit_mode = OvercommitMode::Bounded;
+    pol.overrides.push_back(ov);
+    AF_CHECK(policy_ok(pol));
+    { AdmissionPolicy x = pol; x.overcommit = static_cast<OvercommitMode>(200); AF_CHECK(!policy_ok(x)); }
+    { AdmissionPolicy x = pol; x.overrides[0].overcommit_mode = static_cast<OvercommitMode>(200); AF_CHECK(!policy_ok(x)); }
+
+    auto decision_ok = [](const AdmissionDecision& dec) {
+        ByteWriter w;
+        Status e = encode_decision(w, dec);
+        AdmissionDecision out;
+        ByteReader r(w.data());
+        return e.ok() && decode_decision(r, out).ok();
+    };
+    AdmissionDecision dec;
+    dec.outcome = AdmissionOutcome::Reject;
+    dec.reason = ReasonCode::RejectStale;
+    AF_CHECK(decision_ok(dec));
+    { AdmissionDecision x = dec; x.outcome = static_cast<AdmissionOutcome>(200); AF_CHECK(!decision_ok(x)); }
+    { AdmissionDecision x = dec; x.reason = static_cast<ReasonCode>(999); AF_CHECK(!decision_ok(x)); }
+    { AdmissionDecision x = dec; x.reason = static_cast<ReasonCode>(-1); AF_CHECK(!decision_ok(x)); }
+
+    auto observation_ok = [](const Observation& o) {
+        ByteWriter w;
+        Status e = encode_observation(w, o);
+        Observation out;
+        ByteReader r(w.data());
+        return e.ok() && decode_observation(r, out).ok();
+    };
+    Observation o;
+    o.workload_type = WorkloadType::Other;
+    o.kind = ObservationKind::Aborted;
+    AF_CHECK(observation_ok(o));
+    { Observation x = o; x.kind = static_cast<ObservationKind>(200); AF_CHECK(!observation_ok(x)); }
+    { Observation x = o; x.workload_type = static_cast<WorkloadType>(200); AF_CHECK(!observation_ok(x)); }
+}
+
 AF_TEST_MAIN("admission-fabric-roundtrip");

@@ -167,6 +167,12 @@ private:
     [[nodiscard]] SloFeasibility evaluate_slo_(const AdmissionDescriptor& d, const DurationPrediction& dur) const;
 
     [[nodiscard]] Status transition_(const AdmissionRequestId& id, RequestLifecycle from, RequestLifecycle to, const AdmissionDescriptor& d);
+
+    // Expire provisional reservations whose lifetime has elapsed, returning
+    // their capacity, and move the requests they backed to Expired.
+    void expire_reservations_(TimePoint now);
+    // Reservations that currently hold capacity (provisional or committed).
+    [[nodiscard]] std::uint64_t active_reservation_count_() const;
 };
 
 } // namespace admission_fabric

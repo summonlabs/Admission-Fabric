@@ -56,7 +56,10 @@ AdmissionDecision AdmissionFabric::build_decision_(const AdmissionDescriptor& d,
     dec.model_revision = d.model_revision;
     dec.reason = reason;
     dec.outcome = primary_outcome_of(reason);
-    dec.policy_generation = d.policy_generation;
+    // The decision records the policy that governed it (the latest installed
+    // generation), not the generation the requester stamped on its descriptor.
+    const AdmissionPolicy* governing = policy_.latest();
+    dec.policy_generation = governing != nullptr ? governing->generation : d.policy_generation;
     dec.snapshot_generation = snapshot_.generation;
     dec.admission_generation = AdmissionGeneration(0);
     dec.epoch = CoordinatorEpoch(0);
@@ -91,6 +94,27 @@ Status AdmissionFabric::transition_(const AdmissionRequestId& id, RequestLifecyc
         return Status::success();
     }
     return Status::failure(ErrorCode::OperationNotPermitted, "illegal lifecycle transition");
+}
+
+void AdmissionFabric::expire_reservations_(TimePoint now) {
+    reservations_.expire_stale(now);
+    for (auto& [rid, rec] : requests_) {
+        if (rec.lifecycle != RequestLifecycle::Reserved) continue;
+        if (!rec.last_decision.has_value() || !rec.last_decision->reservation_id.has_value()) continue;
+        const ResourceReservation* r = reservations_.find(*rec.last_decision->reservation_id);
+        if (r != nullptr && r->status == ReservationStatus::Expired) {
+            rec.lifecycle = RequestLifecycle::Expired;
+            rec.updated_at = now;
+        }
+    }
+}
+
+std::uint64_t AdmissionFabric::active_reservation_count_() const {
+    std::uint64_t n = 0;
+    for (const auto& [id, r] : reservations_.reservations()) {
+        if (r.status == ReservationStatus::Reserved || r.status == ReservationStatus::Committed) ++n;
+    }
+    return n;
 }
 
 ReasonCode AdmissionFabric::classify_capability_(const AdmissionDescriptor& d) const {
@@ -168,15 +192,26 @@ Result<AdmissionDecision> AdmissionFabric::evaluate(const AdmissionDescriptor& d
     metrics_.evaluations++;
     // Local helper to finalize a decision for a request (store + lifecycle).
     auto emit = [&](RequestLifecycle to_life, AdmissionDecision& dec, bool admit_metric) {
-        requests_[d.admission_request_id].last_decision = dec;
-        // Guarantee the record is at least in Evaluating so the final
-        // transition is always legal, even for the early malformed path.
-        Status s1 = transition_(d.admission_request_id, RequestLifecycle::Proposed, RequestLifecycle::Evaluating, d);
-        Status s2 = transition_(d.admission_request_id, RequestLifecycle::Evaluating, to_life, d);
-        (void)s1; (void)s2;
+        // A decision is recorded only on the request being decided by this call:
+        // an id seen for the first time, or a record this call moved into
+        // Evaluating. A request that is deferred, reserved, admitted or terminal
+        // keeps its own decision and reservation binding; a duplicate or
+        // malformed submission under its id is answered but never replaces them.
+        auto existing = requests_.find(d.admission_request_id);
+        if (existing == requests_.end() || existing->second.lifecycle == RequestLifecycle::Evaluating) {
+            requests_[d.admission_request_id].last_decision = dec;
+            // Guarantee the record is at least in Evaluating so the final
+            // transition is always legal, even for the early malformed path.
+            Status s1 = transition_(d.admission_request_id, RequestLifecycle::Proposed, RequestLifecycle::Evaluating, d);
+            Status s2 = transition_(d.admission_request_id, RequestLifecycle::Evaluating, to_life, d);
+            (void)s1; (void)s2;
+        }
         if (admit_metric) { metrics_.admissions++; }
         metrics_.count_reason(dec.reason);
     };
+
+    // 0. Reservations whose lifetime elapsed no longer hold capacity.
+    expire_reservations_(SystemClock::now());
 
     // 1. Validate.
     Status v = d.validate();
@@ -202,8 +237,10 @@ Result<AdmissionDecision> AdmissionFabric::evaluate(const AdmissionDescriptor& d
         }
     }
 
-    // 2. Lifecycle entry.
+    // 2. Lifecycle entry. A deferred request re-enters evaluation, so the
+    //    outcome of this evaluation becomes its lifecycle state.
     Status s0 = transition_(d.admission_request_id, RequestLifecycle::Proposed, RequestLifecycle::Evaluating, d);
+    if (!s0.ok()) s0 = transition_(d.admission_request_id, RequestLifecycle::Deferred, RequestLifecycle::Evaluating, d);
     (void)s0;
 
     // 3. Policy.
@@ -266,7 +303,19 @@ Result<AdmissionDecision> AdmissionFabric::evaluate(const AdmissionDescriptor& d
         }
     }
 
-    // 7. Quota.
+    // 7. Quota. A quota snapshot its authority marked stale is not reused as
+    //    current when the policy fails closed.
+    if (quota_.present_ && quota_.stale && pol.quota_fail_closed) {
+        auto dec = build_decision_(d, ReasonCode::DeferQuota);
+        dec.predicted_requirement = ResourceRequirement(demand);
+        dec.memory_prediction = mem; dec.duration_prediction = dur;
+        dec.quota.passed = false; dec.quota.limiting_name = "stale_quota_snapshot";
+        dec.explanation = "quota snapshot is stale and policy fails closed";
+        dec.defer_hint = DeferHint{ReasonCode::DeferQuota, Seconds(5), "", "fresh quota snapshot", "refresh the quota snapshot then retry"};
+        emit(RequestLifecycle::Deferred, dec, false);
+        metrics_.deferrals++; metrics_.quota_failures++;
+        return Result<AdmissionDecision>::ok(std::move(dec));
+    }
     QuotaEvaluation qe;
     std::string quota_what;
     ResourceVector committed_remaining;
@@ -395,7 +444,7 @@ Result<AdmissionDecision> AdmissionFabric::evaluate(const AdmissionDescriptor& d
     dec.explanation = risky ? "admitted with reservation; confidence/SLO margin below strict threshold"
                             : "admitted with reservation; capacity, quota and SLO all feasible";
     emit(RequestLifecycle::Reserved, dec, true);
-    metrics_.active_reservations = reservations_.reservation_count();
+    metrics_.active_reservations = active_reservation_count_();
     return Result<AdmissionDecision>::ok(std::move(dec));
 }
 
@@ -410,7 +459,16 @@ Status AdmissionFabric::commit_admission(const AdmissionRequestId& request_id, c
     if (!rec.last_decision->reservation_id.has_value())
         return Status::failure(ErrorCode::AdmissionWithoutReservation, "decision has no reservation");
     Status s = reservations_.commit(*rec.last_decision->reservation_id, request_id, generation);
-    if (!s.ok()) return s;
+    if (!s.ok()) {
+        // The reservation expired before the commit and its capacity was
+        // returned: the request is no longer reserved.
+        if (s.code() == ErrorCode::ReservationExpired && rec.lifecycle == RequestLifecycle::Reserved) {
+            rec.lifecycle = RequestLifecycle::Expired;
+            rec.updated_at = SystemClock::now();
+            metrics_.active_reservations = active_reservation_count_();
+        }
+        return s;
+    }
     rec.lifecycle = RequestLifecycle::Admitted;
     rec.updated_at = SystemClock::now();
     return Status::success();
@@ -426,7 +484,7 @@ Status AdmissionFabric::release_reservation(const ReservationId& id) {
             rec.updated_at = SystemClock::now();
         }
     }
-    metrics_.active_reservations = reservations_.reservation_count();
+    metrics_.active_reservations = active_reservation_count_();
     return Status::success();
 }
 
@@ -555,6 +613,8 @@ Status AdmissionFabric::restore_state(ByteReader& r) {
     if (!decode_resource_vector(r, res) || !decode_resource_vector(r, used))
         return Status::failure(ErrorCode::PersistenceCorrupt, "reservation sums");
     std::uint8_t om = r.u8();
+    if (om > static_cast<std::uint8_t>(OvercommitMode::PredictionAware))
+        return Status::failure(ErrorCode::PersistenceCorrupt, "bad overcommit mode");
     ResourceVector oca;
     if (!decode_resource_vector(r, oca)) return Status::failure(ErrorCode::PersistenceCorrupt, "overcommit allowance");
     Status rs = reservations_.restore(rsv, res, used);

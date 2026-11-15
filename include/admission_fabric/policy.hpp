@@ -133,6 +133,12 @@ public:
             return Status::failure(ErrorCode::PolicyConflict, "policy generation already installed");
         policies_.emplace(gen, std::move(p));
         if (gen.value() >= latest_.value()) latest_ = gen;
+        // A generation issued later by install() must be newer than every
+        // generation placed here (recovery): otherwise the next install would
+        // reuse a recovered generation number and replace that policy.
+        if (gen.value() >= counter_) {
+            counter_ = (gen.value() == (std::numeric_limits<std::uint64_t>::max)()) ? gen.value() : gen.value() + 1;
+        }
         return Status::success();
     }
 

@@ -8,8 +8,10 @@
 #include "admission_fabric/protocol.hpp"
 #include "admission_fabric/resource.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 using namespace admission_fabric;
 
@@ -235,6 +237,122 @@ AF_TEST(multiprocess_restart_fencing) {
     // Cleanup.
     b.stop();
     a2.stop();
+    c.stop();
+    coord.join();
+}
+
+static Capabilities mp_caps() {
+    Capabilities x;
+    x.add(Capabilities::backend("cuda"));
+    x.add(Capabilities::dtype("fp16"));
+    return x;
+}
+static ResourceVector mp_inventory() {
+    ResourceVector v;
+    v.set(ResourceId::AcceleratorMemory, ByteCount{6} << 30);
+    return v;
+}
+
+// Regression: when an agent registers again on a new connection, the loss of
+// the connection it replaced must not fence the new registration.
+AF_TEST(replaced_agent_connection_does_not_fence_its_successor) {
+    Coordinator c;
+    AF_CHECK(c.bind("127.0.0.1", 0).ok());
+    const std::uint16_t port = c.port();
+    AdmissionPolicy pol;
+    pol.name = "mp";
+    pol.max_snapshot_age = Seconds(30);
+    AF_CHECK(c.engine().install_policy(pol).ok());
+
+    // First connection of agent 1 (boot 100), served on its own thread.
+    std::thread t1([&] { Status s = c.accept_and_handle_once(); (void)s; });
+    Agent first(AgentId(1), AgentBootId(100), mp_caps(), mp_inventory(), "cuda", 0);
+    AF_CHECK(first.connect("127.0.0.1", port).ok());
+    AF_CHECK(first.register_self().ok());
+
+    // The same agent and boot registers on a second connection, which replaces
+    // the first registration.
+    std::thread t2([&] { Status s = c.accept_and_handle_once(); (void)s; });
+    Agent second(AgentId(1), AgentBootId(100), mp_caps(), mp_inventory(), "cuda", 0);
+    AF_CHECK(second.connect("127.0.0.1", port).ok());
+    AF_CHECK(second.register_self().ok());
+    const CoordinatorEpoch epoch_before = c.epoch();
+
+    // The replaced connection closes. Joining its thread is the barrier: its
+    // loss handling has run by then.
+    first.stop();
+    t1.join();
+    AF_CHECK(c.epoch() == epoch_before);   // the live registration was not fenced
+    AF_CHECK(second.send_capacity(mk_snap(AgentId(1), AgentBootId(100), 1, ByteCount{6} << 30)).ok());
+
+    // The loss of the current registration does fence it.
+    second.stop();
+    t2.join();
+    AF_CHECK(c.epoch() != epoch_before);
+    c.stop();
+}
+
+// Regression: every connection is served on its own thread, and all of them
+// decide against one engine. Concurrent clients must leave it exact.
+AF_TEST(concurrent_clients_share_one_engine) {
+    Coordinator c;
+    AF_CHECK(c.bind("127.0.0.1", 0).ok());
+    const std::uint16_t port = c.port();
+    AdmissionPolicy pol;
+    pol.name = "mp";
+    pol.max_snapshot_age = Seconds(30);
+    AF_CHECK(c.engine().install_policy(pol).ok());
+    std::thread coord([&] { Status runres = c.run(); (void)runres; });
+
+    Agent a(AgentId(1), AgentBootId(100), mp_caps(), mp_inventory(), "cuda", 0);
+    AF_CHECK(a.connect("127.0.0.1", port).ok());
+    AF_CHECK(a.register_self().ok());
+    AF_CHECK(a.send_capacity(mk_snap(AgentId(1), AgentBootId(100), 1, ByteCount{6} << 30)).ok());
+
+    const int kClients = 4;
+    const int kOps = 100;
+    std::atomic<int> bad{0};
+    std::atomic<int> admitted{0};
+    std::vector<std::thread> clients;
+    for (int t = 0; t < kClients; ++t) {
+        clients.emplace_back([&, t] {
+            Client cl;
+            if (!cl.connect(port).ok()) { ++bad; return; }
+            for (int i = 0; i < kOps; ++i) {
+                const AdmissionRequestId id(static_cast<std::uint64_t>(10000 * (t + 1) + i));
+                AdmissionDescriptor d = mkdesc(id, TenantId(static_cast<std::uint64_t>(t + 1)));
+                ByteWriter w; encode_evaluate_request(w, d);
+                std::vector<std::uint8_t> out;
+                if (!cl.request(WireType::EvaluateRequest, w.data(), WireType::EvaluateResponse, out).ok()) { ++bad; return; }
+                AdmissionDecision dec; std::int32_t ec = -1;
+                ByteReader rd(out);
+                if (!decode_evaluate_response(rd, dec, ec).ok() || ec != 0) { ++bad; return; }
+                if (!dec.is_admit() || !dec.reservation_id.has_value()) continue;   // deferred: nothing is held
+                ++admitted;
+                ByteWriter cw; encode_commit_request(cw, id, dec.admission_generation);
+                if (!cl.request(WireType::CommitRequest, cw.data(), WireType::CommitResponse, out).ok()) { ++bad; return; }
+                { ByteReader cr(out); if (cr.i32() != static_cast<std::int32_t>(ErrorCode::Ok)) ++bad; }
+                ByteWriter rw; encode_release_request(rw, *dec.reservation_id);
+                if (!cl.request(WireType::ReleaseRequest, rw.data(), WireType::ReleaseResponse, out).ok()) { ++bad; return; }
+                { ByteReader rr(out); if (rr.i32() != static_cast<std::int32_t>(ErrorCode::Ok)) ++bad; }
+            }
+        });
+    }
+    for (auto& th : clients) th.join();
+    AF_CHECK(bad.load() == 0);
+    AF_CHECK(admitted.load() > 0);
+
+    // Every client has finished: the engine must be exact.
+    AF_CHECK(c.engine().request_count() == static_cast<std::size_t>(kClients * kOps));
+    AF_CHECK(c.engine().reservations().verify_accounting());
+    AF_CHECK(c.engine().reservations().reserved().is_zero());
+    AF_CHECK(c.engine().reservations().used().is_zero());
+
+    // Stop the agent and wait until its loss has been handled before the
+    // coordinator goes away (the epoch rolls exactly when that has happened).
+    const CoordinatorEpoch e0 = c.epoch();
+    a.stop();
+    while (c.epoch() == e0) std::this_thread::yield();
     c.stop();
     coord.join();
 }
