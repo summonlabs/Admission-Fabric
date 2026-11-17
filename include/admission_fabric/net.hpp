@@ -45,6 +45,10 @@ public:
     [[nodiscard]] bool valid() const { return sock_ != nullptr; }
     [[nodiscard]] bool is_listener() const { return listener_; }
     void close();
+    // Makes a send or receive that another thread has blocked on this socket
+    // fail, and every later one fail at once. The socket stays open: only its
+    // owner closes it.
+    void interrupt() const noexcept;
 
     [[nodiscard]] Status connect(const std::string& host, std::uint16_t port);
     [[nodiscard]] Status bind_listen(const std::string& host, std::uint16_t port);

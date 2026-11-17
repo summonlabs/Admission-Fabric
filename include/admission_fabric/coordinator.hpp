@@ -10,6 +10,7 @@
 // admit work.
 
 #include <atomic>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -51,7 +52,9 @@ private:
         AgentId id;
         AgentBootId boot;
         ResourceSnapshot snapshot;
-        NetSocket sock;
+        // The connection's socket. It belongs to the connection thread and is
+        // set only while that thread serves the agent.
+        NetSocket* sock{nullptr};
         bool registered{false};
         bool alive{false};
         std::uint64_t capacity_generation{0};
@@ -70,10 +73,26 @@ private:
     std::map<AgentId, std::shared_ptr<AgentConn>> agents_;
     std::thread accept_thread_;
 
-    void dispatch(NetSocket conn);
+    // Connection threads started by run(). Each serves one socket, which is
+    // listed in live_conns_ for as long as it is being served. stop()
+    // interrupts every listed socket and joins every thread, so no connection
+    // thread outlives the coordinator it works on.
+    struct ConnThread {
+        std::thread thread;
+        std::atomic<bool> done{false};
+    };
+    std::mutex conn_mu_;
+    std::list<ConnThread> conn_threads_;
+    std::vector<NetSocket*> live_conns_;
+    bool stopping_{false};
+
+    // Serves one connection to its end on the calling thread.
+    void serve(NetSocket& conn);
+    // Joins and drops the connection threads that have finished.
+    void reap_finished_locked();
+    void dispatch(NetSocket& conn);
     void handle_agent(AgentConn& ctx);
-    void handle_client(NetSocket conn);
-    void handle_client_frame(NetSocket conn, FrameHeader hdr, std::vector<std::uint8_t> payload);
+    void handle_client_frame(NetSocket& conn, FrameHeader hdr, std::vector<std::uint8_t> payload);
     // A copy of the best live agent's snapshot (taken under mu_), if any.
     [[nodiscard]] std::optional<ResourceSnapshot> choose_snapshot(const AdmissionDescriptor& d) const;
     // The connection `ctx` was lost. Fences the agent only if `ctx` is still the

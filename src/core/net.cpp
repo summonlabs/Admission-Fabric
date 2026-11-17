@@ -48,6 +48,15 @@ void NetSocket::close() {
     listener_ = false;
 }
 
+void NetSocket::interrupt() const noexcept {
+    SOCKET s = static_cast<SOCKET>(reinterpret_cast<std::uintptr_t>(sock_));
+    if (s == INVALID_SOCKET) return;
+    ::shutdown(s, SD_BOTH);
+    // shutdown() only fails the calls that follow it. A receive that is
+    // already blocked is ended by cancelling it.
+    ::CancelIoEx(reinterpret_cast<HANDLE>(s), nullptr);
+}
+
 Status NetSocket::connect(const std::string& host, std::uint16_t port) {
     Status w = init_winsock_once();
     if (!w.ok()) return w;
@@ -200,6 +209,7 @@ NetSocket::~NetSocket() { close(); }
 NetSocket::NetSocket(NetSocket&&) noexcept = default;
 NetSocket& NetSocket::operator=(NetSocket&&) noexcept = default;
 void NetSocket::close() {}
+void NetSocket::interrupt() const noexcept {}
 Status NetSocket::connect(const std::string&, std::uint16_t) { return Status::failure(ErrorCode::NotImplemented, "no socket backend"); }
 Status NetSocket::bind_listen(const std::string&, std::uint16_t) { return Status::failure(ErrorCode::NotImplemented, "no socket backend"); }
 Status NetSocket::accept(NetSocket&) const { return Status::failure(ErrorCode::NotImplemented, "no socket backend"); }

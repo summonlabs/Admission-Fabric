@@ -357,4 +357,49 @@ AF_TEST(concurrent_clients_share_one_engine) {
     coord.join();
 }
 
+// Regression: connection threads work on the coordinator, so none of them may
+// outlive stop(). stop() ends every live connection, including one whose peer
+// connected and never sent anything, and waits for its thread. Afterwards no
+// request on any of those connections is answered.
+AF_TEST(stop_ends_every_live_connection) {
+    Coordinator c;
+    AF_CHECK(c.bind("127.0.0.1", 0).ok());
+    const std::uint16_t port = c.port();
+    AdmissionPolicy pol;
+    pol.name = "mp";
+    pol.max_snapshot_age = Seconds(30);
+    AF_CHECK(c.engine().install_policy(pol).ok());
+    std::thread coord([&] { Status runres = c.run(); (void)runres; });
+
+    // A registered agent, a client that has completed a request, and a peer
+    // that only connected.
+    Agent a(AgentId(1), AgentBootId(100), mp_caps(), mp_inventory(), "cuda", 0);
+    AF_CHECK(a.connect("127.0.0.1", port).ok());
+    AF_CHECK(a.register_self().ok());
+    AF_CHECK(a.send_capacity(mk_snap(AgentId(1), AgentBootId(100), 1, ByteCount{6} << 30)).ok());
+
+    Client served;
+    AF_CHECK(served.connect(port).ok());
+    ByteWriter first;
+    encode_evaluate_request(first, mkdesc(AdmissionRequestId(1), TenantId(1)));
+    std::vector<std::uint8_t> out;
+    AF_CHECK(served.request(WireType::EvaluateRequest, first.data(), WireType::EvaluateResponse, out).ok());
+
+    Client silent;
+    AF_CHECK(silent.connect(port).ok());
+
+    c.stop();
+    coord.join();
+    const std::size_t requests_at_stop = c.engine().request_count();
+
+    ByteWriter second;
+    encode_evaluate_request(second, mkdesc(AdmissionRequestId(2), TenantId(1)));
+    AF_CHECK(!served.request(WireType::EvaluateRequest, second.data(), WireType::EvaluateResponse, out).ok());
+    ByteWriter third;
+    encode_evaluate_request(third, mkdesc(AdmissionRequestId(3), TenantId(1)));
+    AF_CHECK(!silent.request(WireType::EvaluateRequest, third.data(), WireType::EvaluateResponse, out).ok());
+    AF_CHECK(!a.send_capacity(mk_snap(AgentId(1), AgentBootId(100), 2, ByteCount{6} << 30)).ok());
+    AF_CHECK(c.engine().request_count() == requests_at_stop);
+}
+
 AF_TEST_MAIN("admission-fabric-restart");

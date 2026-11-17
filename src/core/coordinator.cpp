@@ -17,7 +17,41 @@ CoordinatorEpoch Coordinator::next_epoch_() { return epoch_.next(); }
 void Coordinator::stop() {
     running_ = false;
     listener_.close();
+    std::list<ConnThread> threads;
+    {
+        std::lock_guard<std::mutex> lk(conn_mu_);
+        stopping_ = true;
+        // A connection thread may be blocked in a receive on a peer that stays
+        // silent. End that receive, or the join below would wait on the peer.
+        for (NetSocket* live : live_conns_) live->interrupt();
+        threads.swap(conn_threads_);
+    }
+    for (ConnThread& t : threads) {
+        if (t.thread.joinable()) t.thread.join();
+    }
     if (accept_thread_.joinable()) accept_thread_.join();
+}
+
+void Coordinator::reap_finished_locked() {
+    for (auto it = conn_threads_.begin(); it != conn_threads_.end();) {
+        if (it->done.load()) {
+            it->thread.join();
+            it = conn_threads_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Coordinator::serve(NetSocket& conn) {
+    {
+        std::lock_guard<std::mutex> lk(conn_mu_);
+        if (stopping_) return;
+        live_conns_.push_back(&conn);
+    }
+    dispatch(conn);
+    std::lock_guard<std::mutex> lk(conn_mu_);
+    live_conns_.erase(std::find(live_conns_.begin(), live_conns_.end(), &conn));
 }
 
 Status Coordinator::run() {
@@ -26,7 +60,15 @@ Status Coordinator::run() {
         NetSocket conn;
         Status s = listener_.accept(conn);
         if (!s.ok()) return s;
-        std::thread([this, c = std::move(conn)]() mutable { dispatch(std::move(c)); }).detach();
+        std::lock_guard<std::mutex> lk(conn_mu_);
+        if (stopping_) break;
+        reap_finished_locked();
+        conn_threads_.emplace_back();
+        ConnThread& slot = conn_threads_.back();
+        slot.thread = std::thread([this, &slot, c = std::move(conn)]() mutable {
+            serve(c);
+            slot.done = true;
+        });
     }
     return Status::success();
 }
@@ -35,7 +77,7 @@ Status Coordinator::accept_and_handle_once() {
     NetSocket conn;
     Status s = listener_.accept(conn);
     if (!s.ok()) return s;
-    dispatch(std::move(conn));
+    serve(conn);
     return Status::success();
 }
 
@@ -44,7 +86,7 @@ std::size_t Coordinator::agent_count() const {
     return agents_.size();
 }
 
-void Coordinator::dispatch(NetSocket conn) {
+void Coordinator::dispatch(NetSocket& conn) {
     FrameHeader hdr;
     std::vector<std::uint8_t> payload;
     Status s = conn.recv_frame(hdr, payload);
@@ -56,7 +98,7 @@ void Coordinator::dispatch(NetSocket conn) {
         Status ds = decode_register(r, id, boot, caps, inv, dev, idx);
         if (!ds.ok()) return;
         auto ctx = std::make_shared<AgentConn>();
-        ctx->id = id; ctx->boot = boot; ctx->sock = std::move(conn);
+        ctx->id = id; ctx->boot = boot; ctx->sock = &conn;
         ctx->registered = true; ctx->alive = true;
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -64,30 +106,35 @@ void Coordinator::dispatch(NetSocket conn) {
             if (it != agents_.end() && it->second->alive && it->second->boot != boot) {
                 // A live agent claiming a different boot identity is stale.
                 ByteWriter w; encode_error_response(w, ErrorCode::AgentBootMismatch, "stale or mismatched agent boot identity");
-                admission_fabric::send_frame(ctx->sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
+                admission_fabric::send_frame(conn, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                 return;
             }
             agents_[id] = ctx;   // replaces a dead (fenced) agent with a fresh boot
         }
         ByteWriter w;
         w.u64(epoch().value());
-        admission_fabric::send_frame(ctx->sock, static_cast<std::uint16_t>(WireType::AgentRegistered), hdr.correlation, w.data());
+        admission_fabric::send_frame(conn, static_cast<std::uint16_t>(WireType::AgentRegistered), hdr.correlation, w.data());
         handle_agent(*ctx);
+        // The agent's entry stays in the table after its connection has ended;
+        // the socket does not.
+        std::lock_guard<std::mutex> lk(mu_);
+        ctx->sock = nullptr;
     } else {
         // Client/control connection: re-dispatch the first frame then loop.
-        handle_client_frame(std::move(conn), hdr, payload);
+        handle_client_frame(conn, hdr, payload);
     }
 }
 
 void Coordinator::handle_agent(AgentConn& ctx) {
+    NetSocket& sock = *ctx.sock;
     for (;;) {
         FrameHeader hdr;
         std::vector<std::uint8_t> payload;
-        Status s = ctx.sock.recv_frame(hdr, payload);
+        Status s = sock.recv_frame(hdr, payload);
         if (!s.ok()) { on_agent_loss(ctx); return; }
         if (hdr.type == static_cast<std::uint16_t>(WireType::Heartbeat)) {
             ByteWriter w; w.u64(epoch().value());
-            admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::Heartbeat), hdr.correlation, w.data());
+            admission_fabric::send_frame(sock, static_cast<std::uint16_t>(WireType::Heartbeat), hdr.correlation, w.data());
             continue;
         }
         if (hdr.type == static_cast<std::uint16_t>(WireType::CapacityUpdate)) {
@@ -97,23 +144,23 @@ void Coordinator::handle_agent(AgentConn& ctx) {
             Status ds = decode_capacity_update(r, snap);
             if (!ds.ok()) {
                 ByteWriter w; encode_error_response(w, ErrorCode::MalformedFrame, "bad capacity update");
-                admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
+                admission_fabric::send_frame(sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                 continue;
             }
             // Authority: epoch must be current, boot must match the registered agent.
             if (epoch_val != epoch().value()) {
                 ByteWriter w; encode_error_response(w, ErrorCode::StaleEpoch, "stale coordinator epoch");
-                admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
+                admission_fabric::send_frame(sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                 continue;
             }
             if (snap.boot_id != ctx.boot || snap.agent_id != ctx.id) {
                 ByteWriter w; encode_error_response(w, ErrorCode::StaleBootIdentity, "stale agent boot identity");
-                admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
+                admission_fabric::send_frame(sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                 continue;
             }
             if (ctx.capacity_generation != 0 && snap.generation.value() <= ctx.capacity_generation) {
                 ByteWriter w; encode_error_response(w, ErrorCode::StaleSnapshotGeneration, "stale resource snapshot generation");
-                admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
+                admission_fabric::send_frame(sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
                 continue;
             }
             {
@@ -123,16 +170,16 @@ void Coordinator::handle_agent(AgentConn& ctx) {
                 ctx.capacity_generation = snap.generation.value();
             }
             ByteWriter w; w.u64(snap.generation.value());
-            admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::CapacityAccepted), hdr.correlation, w.data());
+            admission_fabric::send_frame(sock, static_cast<std::uint16_t>(WireType::CapacityAccepted), hdr.correlation, w.data());
             continue;
         }
         // Unknown message from an agent.
         ByteWriter w; encode_error_response(w, ErrorCode::UnknownMessage, wire_type_name(static_cast<WireType>(hdr.type)));
-        admission_fabric::send_frame(ctx.sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
+        admission_fabric::send_frame(sock, static_cast<std::uint16_t>(WireType::ErrorResponse), hdr.correlation, w.data());
     }
 }
 
-void Coordinator::handle_client_frame(NetSocket conn, FrameHeader hdr, std::vector<std::uint8_t> payload) {
+void Coordinator::handle_client_frame(NetSocket& conn, FrameHeader hdr, std::vector<std::uint8_t> payload) {
     for (;;) {
         switch (static_cast<WireType>(hdr.type)) {
             case WireType::EvaluateRequest: {
